@@ -10,6 +10,7 @@
 
 #include "mz.h"
 #include "mz_strm.h"
+#include "mz_strm_buf.h"
 #include "mz_strm_mem.h"
 
 #include <gtest/gtest.h>
@@ -230,4 +231,211 @@ TEST_P(stream_find, find) {
 
     for (c = 1; c < (int32_t)strlen(find); c += 1)
         param.test_cb(param.name, 2096, (const uint8_t *)find, c, param.find_cb);
+}
+
+TEST(stream_buffered_seek, end_flushes_pending_write) {
+    void *mem_stream = mz_stream_mem_create();
+    void *buffered_stream = mz_stream_buffered_create();
+    const void *buffer = NULL;
+    int64_t length = 0;
+
+    ASSERT_NE(mem_stream, nullptr);
+    ASSERT_NE(buffered_stream, nullptr);
+    ASSERT_EQ(mz_stream_mem_open(mem_stream, NULL, MZ_OPEN_MODE_CREATE), MZ_OK);
+    mz_stream_set_base(buffered_stream, mem_stream);
+
+    EXPECT_EQ(mz_stream_write(buffered_stream, "abc", 3), 3);
+    EXPECT_EQ(mz_stream_seek(buffered_stream, -1, MZ_SEEK_END), MZ_OK);
+    EXPECT_EQ(mz_stream_write(buffered_stream, "Z", 1), 1);
+    EXPECT_EQ(mz_stream_close(buffered_stream), MZ_OK);
+
+    mz_stream_mem_get_buffer_length(mem_stream, &length);
+    ASSERT_EQ(length, 3);
+    ASSERT_EQ(mz_stream_mem_get_buffer(mem_stream, &buffer), MZ_OK);
+    EXPECT_EQ(memcmp(buffer, "abZ", 3), 0);
+
+    mz_stream_buffered_delete(&buffered_stream);
+    mz_stream_mem_delete(&mem_stream);
+}
+
+TEST(stream_buffered_seek, cur_before_start_preserves_position) {
+    char input[] = "abcdefghij";
+    char output[5];
+    char next = 0;
+    void *mem_stream = mz_stream_mem_create();
+    void *buffered_stream = mz_stream_buffered_create();
+
+    ASSERT_NE(mem_stream, nullptr);
+    ASSERT_NE(buffered_stream, nullptr);
+    mz_stream_mem_set_buffer(mem_stream, input, 10);
+    ASSERT_EQ(mz_stream_mem_open(mem_stream, NULL, MZ_OPEN_MODE_READ), MZ_OK);
+    mz_stream_set_base(buffered_stream, mem_stream);
+
+    ASSERT_EQ(mz_stream_read(buffered_stream, output, sizeof(output)), 5);
+    EXPECT_EQ(mz_stream_seek(buffered_stream, -6, MZ_SEEK_CUR), MZ_SEEK_ERROR);
+    EXPECT_EQ(mz_stream_tell(buffered_stream), 5);
+    EXPECT_EQ(mz_stream_read(buffered_stream, &next, 1), 1);
+    EXPECT_EQ(next, 'f');
+
+    mz_stream_buffered_delete(&buffered_stream);
+    mz_stream_mem_delete(&mem_stream);
+}
+
+TEST(stream_buffered_seek, cur_within_read_buffer) {
+    char input[] = "abcdefghij";
+    char output[5];
+    char next = 0;
+    void *mem_stream = mz_stream_mem_create();
+    void *buffered_stream = mz_stream_buffered_create();
+
+    ASSERT_NE(mem_stream, nullptr);
+    ASSERT_NE(buffered_stream, nullptr);
+    mz_stream_mem_set_buffer(mem_stream, input, 10);
+    ASSERT_EQ(mz_stream_mem_open(mem_stream, NULL, MZ_OPEN_MODE_READ), MZ_OK);
+    mz_stream_set_base(buffered_stream, mem_stream);
+
+    ASSERT_EQ(mz_stream_read(buffered_stream, output, sizeof(output)), 5);
+    EXPECT_EQ(mz_stream_seek(buffered_stream, -2, MZ_SEEK_CUR), MZ_OK);
+    EXPECT_EQ(mz_stream_tell(buffered_stream), 3);
+    EXPECT_EQ(mz_stream_read(buffered_stream, &next, 1), 1);
+    EXPECT_EQ(next, 'd');
+
+    mz_stream_buffered_delete(&buffered_stream);
+    mz_stream_mem_delete(&mem_stream);
+}
+
+TEST(stream_buffered_seek, cur_beyond_write_buffer_flushes) {
+    void *mem_stream = mz_stream_mem_create();
+    void *buffered_stream = mz_stream_buffered_create();
+    const void *buffer = NULL;
+    int64_t length = 0;
+
+    ASSERT_NE(mem_stream, nullptr);
+    ASSERT_NE(buffered_stream, nullptr);
+    ASSERT_EQ(mz_stream_mem_open(mem_stream, NULL, MZ_OPEN_MODE_CREATE), MZ_OK);
+    ASSERT_EQ(mz_stream_write(mem_stream, "0123456789", 10), 10);
+    ASSERT_EQ(mz_stream_seek(mem_stream, 5, MZ_SEEK_SET), MZ_OK);
+    mz_stream_set_base(buffered_stream, mem_stream);
+    ASSERT_EQ(mz_stream_tell(buffered_stream), 5);
+
+    EXPECT_EQ(mz_stream_write(buffered_stream, "abc", 3), 3);
+    EXPECT_EQ(mz_stream_seek(buffered_stream, -1, MZ_SEEK_CUR), MZ_OK);
+    EXPECT_EQ(mz_stream_seek(buffered_stream, 3, MZ_SEEK_CUR), MZ_OK);
+    EXPECT_EQ(mz_stream_tell(buffered_stream), 10);
+    EXPECT_EQ(mz_stream_write(buffered_stream, "Z", 1), 1);
+    EXPECT_EQ(mz_stream_close(buffered_stream), MZ_OK);
+
+    mz_stream_mem_get_buffer_length(mem_stream, &length);
+    ASSERT_EQ(length, 11);
+    ASSERT_EQ(mz_stream_mem_get_buffer(mem_stream, &buffer), MZ_OK);
+    EXPECT_EQ(memcmp(buffer, "01234abc89Z", 11), 0);
+
+    mz_stream_buffered_delete(&buffered_stream);
+    mz_stream_mem_delete(&mem_stream);
+}
+
+struct stream_no_tell {
+    mz_stream stream;
+    int32_t seek_calls;
+    int32_t tell_calls;
+};
+
+static int32_t stream_no_tell_is_open(void *stream) {
+    return mz_stream_is_open(((stream_no_tell *)stream)->stream.base);
+}
+
+static int32_t stream_no_tell_read(void *stream, void *buf, int32_t size) {
+    return mz_stream_read(((stream_no_tell *)stream)->stream.base, buf, size);
+}
+
+static int32_t stream_no_tell_write(void *stream, const void *buf, int32_t size) {
+    return mz_stream_write(((stream_no_tell *)stream)->stream.base, buf, size);
+}
+
+static int64_t stream_no_tell_tell(void *stream) {
+    ((stream_no_tell *)stream)->tell_calls += 1;
+    return MZ_INTERNAL_ERROR;
+}
+
+static int32_t stream_no_tell_seek(void *stream, int64_t offset, int32_t origin) {
+    ((stream_no_tell *)stream)->seek_calls += 1;
+    return mz_stream_seek(((stream_no_tell *)stream)->stream.base, offset, origin);
+}
+
+static int32_t stream_no_tell_close(void *stream) {
+    return mz_stream_close(((stream_no_tell *)stream)->stream.base);
+}
+
+static int32_t stream_no_tell_error(void *stream) {
+    return mz_stream_error(((stream_no_tell *)stream)->stream.base);
+}
+
+static mz_stream_vtbl stream_no_tell_vtbl = {NULL, stream_no_tell_is_open, stream_no_tell_read,  stream_no_tell_write,
+                                            stream_no_tell_tell, stream_no_tell_seek,    stream_no_tell_close,
+                                            stream_no_tell_error, NULL, NULL, NULL, NULL};
+
+TEST(stream_buffered_seek, end_without_base_tell_keeps_write_read_position) {
+    void *mem_stream = mz_stream_mem_create();
+    void *buffered_stream = mz_stream_buffered_create();
+    stream_no_tell base = {};
+    char next = 0;
+    const void *buffer = NULL;
+
+    ASSERT_NE(mem_stream, nullptr);
+    ASSERT_NE(buffered_stream, nullptr);
+    ASSERT_EQ(mz_stream_mem_open(mem_stream, NULL, MZ_OPEN_MODE_CREATE), MZ_OK);
+    ASSERT_EQ(mz_stream_write(mem_stream, "abcdef", 6), 6);
+    base.stream.vtbl = &stream_no_tell_vtbl;
+    mz_stream_set_base(&base, mem_stream);
+    mz_stream_set_base(buffered_stream, &base);
+
+    EXPECT_EQ(mz_stream_seek(buffered_stream, -3, MZ_SEEK_END), MZ_OK);
+    EXPECT_EQ(base.tell_calls, 0);
+    EXPECT_EQ(mz_stream_write(buffered_stream, "XYZ", 3), 3);
+    EXPECT_EQ(mz_stream_tell(buffered_stream), MZ_INTERNAL_ERROR);
+    EXPECT_EQ(mz_stream_seek(buffered_stream, -2, MZ_SEEK_CUR), MZ_OK);
+    EXPECT_EQ(mz_stream_read(buffered_stream, &next, 1), 1);
+    EXPECT_EQ(next, 'Y');
+    EXPECT_EQ(mz_stream_close(buffered_stream), MZ_OK);
+    ASSERT_EQ(mz_stream_mem_get_buffer(mem_stream, &buffer), MZ_OK);
+    EXPECT_EQ(memcmp(buffer, "abcXYZ", 6), 0);
+
+    mz_stream_buffered_delete(&buffered_stream);
+    mz_stream_mem_delete(&mem_stream);
+}
+
+TEST(stream_buffered_seek, end_without_base_tell_skips_set_fast_path) {
+    void *mem_stream = mz_stream_mem_create();
+    void *buffered_stream = mz_stream_buffered_create();
+    stream_no_tell base = {};
+    char next = 0;
+    const void *buffer = NULL;
+    int32_t seek_calls = 0;
+
+    ASSERT_NE(mem_stream, nullptr);
+    ASSERT_NE(buffered_stream, nullptr);
+    ASSERT_EQ(mz_stream_mem_open(mem_stream, NULL, MZ_OPEN_MODE_CREATE), MZ_OK);
+    ASSERT_EQ(mz_stream_write(mem_stream, "abcdefghijklmnopqrst", 20), 20);
+    base.stream.vtbl = &stream_no_tell_vtbl;
+    mz_stream_set_base(&base, mem_stream);
+    mz_stream_set_base(buffered_stream, &base);
+
+    EXPECT_EQ(mz_stream_seek(buffered_stream, 2, MZ_SEEK_SET), MZ_OK);
+    EXPECT_EQ(mz_stream_seek(buffered_stream, 1, MZ_SEEK_CUR), MZ_OK);
+    EXPECT_EQ(mz_stream_seek(buffered_stream, -3, MZ_SEEK_END), MZ_OK);
+    EXPECT_EQ(mz_stream_seek(buffered_stream, 0, MZ_SEEK_CUR), MZ_OK);
+    EXPECT_EQ(base.tell_calls, 0);
+    EXPECT_EQ(mz_stream_read(buffered_stream, &next, 1), 1);
+    EXPECT_EQ(next, 'r');
+    EXPECT_EQ(mz_stream_write(buffered_stream, "Q", 1), 1);
+    seek_calls = base.seek_calls;
+    EXPECT_EQ(mz_stream_seek(buffered_stream, 3, MZ_SEEK_SET), MZ_OK);
+    EXPECT_EQ(base.seek_calls, seek_calls + 1);
+    EXPECT_EQ(mz_stream_read(buffered_stream, &next, 1), 1);
+    EXPECT_EQ(next, 'd');
+    ASSERT_EQ(mz_stream_mem_get_buffer(mem_stream, &buffer), MZ_OK);
+    EXPECT_EQ(memcmp(buffer, "abcdefghijklmnopqrQt", 20), 0);
+
+    mz_stream_buffered_delete(&buffered_stream);
+    mz_stream_mem_delete(&mem_stream);
 }

@@ -10,6 +10,7 @@
 
 #include "mz.h"
 #include "mz_strm.h"
+#include "mz_strm_buf.h"
 #include "mz_strm_mem.h"
 
 #include <gtest/gtest.h>
@@ -230,4 +231,76 @@ TEST_P(stream_find, find) {
 
     for (c = 1; c < (int32_t)strlen(find); c += 1)
         param.test_cb(param.name, 2096, (const uint8_t *)find, c, param.find_cb);
+}
+
+struct buffered_test_stream {
+    mz_stream stream;
+    int32_t write_result;
+    int32_t close_result;
+    int32_t write_calls;
+    int32_t close_calls;
+};
+
+static int32_t buffered_test_is_open(void *stream) {
+    MZ_UNUSED(stream);
+    return MZ_OK;
+}
+
+static int32_t buffered_test_write(void *stream, const void *buf, int32_t size) {
+    buffered_test_stream *base = (buffered_test_stream *)stream;
+    MZ_UNUSED(buf);
+    MZ_UNUSED(size);
+    base->write_calls += 1;
+    return base->write_result;
+}
+
+static int32_t buffered_test_close(void *stream) {
+    buffered_test_stream *base = (buffered_test_stream *)stream;
+    base->close_calls += 1;
+    return base->close_result;
+}
+
+static mz_stream_vtbl buffered_test_vtbl = {NULL,
+                                            buffered_test_is_open,
+                                            NULL,
+                                            buffered_test_write,
+                                            NULL,
+                                            NULL,
+                                            buffered_test_close,
+                                            NULL,
+                                            NULL,
+                                            NULL,
+                                            NULL,
+                                            NULL};
+
+TEST(stream_buffered, close_preserves_flush_error) {
+    struct test_case {
+        int32_t write_result;
+        int32_t close_result;
+        int32_t expected;
+    } cases[] = {{MZ_WRITE_ERROR, MZ_OK, MZ_WRITE_ERROR},
+                 {2, MZ_OK, MZ_WRITE_ERROR},
+                 {MZ_WRITE_ERROR, MZ_CLOSE_ERROR, MZ_WRITE_ERROR},
+                 {3, MZ_CLOSE_ERROR, MZ_CLOSE_ERROR},
+                 {3, MZ_OK, MZ_OK}};
+
+    for (const auto &test : cases) {
+        SCOPED_TRACE(::testing::Message() << "write=" << test.write_result << " close=" << test.close_result);
+        buffered_test_stream base = {};
+        base.stream.vtbl = &buffered_test_vtbl;
+        base.write_result = test.write_result;
+        base.close_result = test.close_result;
+
+        void *buffered = mz_stream_buffered_create();
+        ASSERT_NE(buffered, nullptr);
+        mz_stream_set_base(buffered, &base);
+
+        EXPECT_EQ(mz_stream_write(buffered, "abc", 3), 3);
+        EXPECT_EQ(base.write_calls, 0);
+        EXPECT_EQ(mz_stream_close(buffered), test.expected);
+        EXPECT_EQ(base.write_calls, 1);
+        EXPECT_EQ(base.close_calls, 1);
+
+        mz_stream_buffered_delete(&buffered);
+    }
 }
